@@ -1,0 +1,567 @@
+#!/bin/bash
+
+#=============================================================================================
+### Fungi MiSeq processing pipeline (paired-end demultiplexed reads) ###
+#=============================================================================================
+
+## Pipeline history:
+# Developed September 2017 (M Hoggard)
+
+### Fungi-specific processing
+# This pipeline does not merge forward and reverse reads. Due to varying lengths of ITS regions, some ITS sequences may be too long for the overlap and these sequences will be lost if reads are merged (i.e. you might filter out some taxa which have long ITS regions). 
+# It is necessary to trim any retained reverse primer-binding regions. Sequences for fungi with shorter ITS regions than the read length will include the primer region + sequence for the adapter + random junk sequence. This needs to be timmed.
+#   This timming of the reverse primer region is handled by some of the awk and -search_oligodb commands included below.
+
+### Linux/Windows conflicts
+# Pipeline developed in a windows environment (but has also been tested in a Linux (Ubuntu) environment). 
+# Some commands (such as the custom awk commands) *may* not work properly on some platforms due to differences in how different versions of awk runs - monitor that the outputs are as expected.
+
+### usearch manual
+# http://www.drive5.com/usearch/
+
+
+#=============================================================================================
+
+### References 
+# If you use this pipeline you should cite all of these Edgar references (the first one is for the program (usearch), and the rest are for specific processing steps), the taxonomy reference database you used, and preferably this pipeline as well/one of the author's papers that uses this pipeline.
+
+
+## USEARCH
+# Edgar,RC (2010) Search and clustering orders of magnitude faster than BLAST, Bioinformatics 26(19), 2460-2461. doi: 10.1093/bioinformatics/btq461.
+
+## Expected error filtering and paired read merging:
+# Edgar, R.C. and Flyvbjerg, H (2014) Error filtering, pair assembly and error correction for next-generation sequencing reads. doi: 10.1093/bioinformatics/btv401.
+
+## UNOISE algorithm
+# Edgar, R.C. (2016), UNOISE2: Improved error-correction for Illumina 16S and ITS amplicon reads. doi: 10.1101/081257.
+
+## SINTAX algorithm
+# Edgar, R.C. (2016), SINTAX, a simple non-Bayesian taxonomy classifier for 16S and ITS sequences. doi: 10.1101/074161.
+
+## UNCROSS paper (This algorithm isn't used here, but this paper discusses the concept of cross-talk)
+# Edgar RC. UNCROSS: Filtering of high-frequency cross-talk in 16S amplicon reads. bioRxiv. 2016;:doi: 10.1101/088666.
+
+## RDP ITS database reference (usearch version downloaded from drive5.com) 
+# Cole JR, Wang Q, Fish JA, Chai B, McGarrell DM, Sun Y, et al. Ribosomal Database Project: Data and tools for high throughput rRNA analysis. Nucleic Acids Res. 2014;42:D633–42.
+
+## UNITE ITS database reference (usearch version downloaded from drive5.com)
+# UNITE Community. UNITE USEARCH/UTAX release. 2017.
+
+## This bioinformatics pipeline (initial reference using this pipeline)
+# Hoggard et al., Characterising the human mycobiota: a comparison of small subunit rRNA, ITS1, ITS2, and large subunit rRNA genomic targets (Under review).
+
+
+ 
+#============================================================================================================================
+### 1.1 Fungi MiSeq bioinformatics pipeline: Step-by-step commentary ###
+#============================================================================================================================
+
+### Before you start: 
+
+## i. /raw_data
+# Make a new directory /raw_data in your working/data directory.
+# Add all your raw sequence data to this directory
+
+## ii. primerR.fa
+# In your working directory, make primerR.fa file listing the sequence of the reverse primer used in fasta format (excluding any adapter sequence). 
+# i.e. for ITS2 marker:
+#   primerR.fa
+#   >ITS4
+#   TCCTCCGCTTATTGATATGC
+
+
+### Notes:
+# Compiled command lines (without full comments for each step) are provided/reprinted at the end of this document (with single comments to indicate when manual intervention is required).
+
+
+#============================================================================================================================
+
+## Change directory to working directory 
+
+cd "working_directory_path"
+
+
+## Start log file
+
+script logfile_$(date "+%Y.%m.%d-%H.%M").txt
+
+
+## unzip data files if necessary 
+
+gunzip raw_data/*.gz -f
+
+
+## Relabel sample labels in .fastq files based on file name
+# *R1_001.fastq identifies only forward reads (R1), so will automatically exclude reverse reads (if you have them in the same directory)
+
+mkdir -p filter/raw_data
+for i in raw_data/*R1_001.fastq
+do
+IN=$i;
+OUT=filter/${IN%R1_001}.fq
+usearch -fastq_filter $IN -relabel @ -fastqout $OUT; 
+done
+
+
+## Concatenate fq files into single fq
+
+cat filter/raw_data/*.fq > filter/seqs.fq
+
+
+## Trim forward primer-binding region
+# Dr Edgar recommends trimming primer-binding sequences (you can read about it here: http://drive5.com/usearch/manual/pipe_readprep_primers.html)
+# The forward primer is trimmed here with -stripleft. Enter the number of base pairs of the foward primer used (e.g. for ITS2 region, primer ITS3 = 20)
+# The reverse primer region is more complicated and is trimmed separately below.
+
+usearch -fastx_truncate filter/seqs.fq -stripleft 25 -fastqout filter/seqs_trim.fq
+
+
+## Summary report of fastx file
+
+usearch -fastx_info filter/seqs_trim.fq -secs 20
+
+
+## Identify length to trim to to remove poor quality tails of reads 
+# As read quality tends to decrease towards the ends of reads (normally improved once they're merged with an overlapping reverse read) you may wish to trim the tails of reads off. (Trimming will retain more reads overall in the following -fastq_filter step below, as that is based on max expected error being below 1.0 for the full read)
+# From the output, identify the read length that is the best compromise between longer length reads (for increased phylogenetic resolution) and % reads that will be retained with MaxEE = 1.0.
+# (n.b. total read length is now MiSeq read length (e.g. 250 or 300 bp) minus trimmed primer length (carried out above))
+
+usearch -fastq_eestats2 filter/seqs_trim.fq -output filter/eestats2.txt -length_cutoffs 170,*,10
+
+
+# Truncate reads
+# Select read lenth to trim to (based on eestats2 output above) with -fastq_trunclen
+# (n.b. the actual filtering step (using -fastq_filter) based on -fastq_maxee is done as a separate step after trimming of any retained sequence matching reverse primer-binding regions (carried out below))
+
+usearch -fastq_filter filter/seqs_trim.fq -fastqout filter/seqs_trunc.fq -fastq_truncqual 3 -fastq_trunclen 210
+
+
+## Summary report of fastx file
+
+usearch -fastx_info filter/seqs_trunc.fq -secs 20
+
+
+#============================================================================================================================
+
+### Trim reverse primer binding regions
+# It is necessary to trim any retained reverse primer-binding regions (see note above)
+# The following steps search the reads for the reverse compliment of the reverse primer (rev comp, since it is looking on the forward read), and truncates reads and associated q-scores at this position.
+
+
+## Prepare primers id file
+# Make reverse compliment primerR.fa file(for the reverse primer-binding region found on the forward read)
+
+mkdir -p primers_filt
+usearch -fastx_revcomp primerR.fa -label_suffix _RC -fastaout primers_filt/primerR_RC.fa
+
+
+## Identify retained primer sequence and junk sequence
+# From Dr Edgar (usearch developer): If any ITS regions are shorter than the read length (e.g. shorter than 250 or 300 bp) the read will reach and include the reverse primer, adapter sequence and then random junk. search_oligodb can find the reverse primer, but there is currently no way in usearch to truncate these reads (have to do this manually in the seqs_filt.fq file.
+# The following set of commands are my approach to do this
+# These commands: 
+#   Extract the sequences out that have matches to the primers (including up to two mismatches) via search_oligodb
+#   Use the primers (and mismatches) as search strings to identify lines and character positions of each primer, and the matching line and positions of the relevant q-scores (two lines below the sequence line)
+#   Trim the primer sequences (and any associated adapter/junk sequence that follows) *and* the matching q-scores from the seqs fastq file
+#   Append the trimmed data back onto the end of the rest of the dataset. 
+
+## Identify primer matches
+
+usearch -search_oligodb filter/seqs_trunc.fq -db primers_filt/primerR_RC.fa -strand plus -userout primers_filt/primer_matches.txt -userfields query+target+diffs+trowdots+qrow+qlor+qhir
+
+
+## Extract sequence ids for those with matches to the primer sequences
+
+awk '{print $1}' primers_filt/primer_matches.txt > primers_filt/primer_matches_labels.txt
+
+
+## Extract the sequences that include matches to the reverse primer
+
+usearch -fastx_getseqs filter/seqs_trunc.fq -labels primers_filt/primer_matches_labels.txt -fastqout primers_filt/primer.matches.fq -notmatchedfq primers_filt/primer.notmatched.fq
+
+
+## Identify lines and the character positions for each primer, and the matching line and positions of the relevant q-scores
+# These commands identify the positions of the search strings (the primer sequences, as well as mismatches taken from the -search_oligodb output), generates a copy with line numbers + 2 (the line of the associated q-scores), and then creates one list with all the line numbers and positions to subsequently trim from.
+# (caveat: this won't identify if the primer-binding region has an insertion or deletion in the sequence, but (hopefully) that is not too common for any successfully amplified amplicons)
+# The last awk command in each group truncates the target sequences (and matching q-scores) from the .fq file based on the listed line numbers and positions (i.e. trim line x from position y until the end of the line) from primerR_matches_strings.txt
+
+usearch -search_oligodb primers_filt/primer.matches.fq -db primers_filt/primerR_RC.fa -strand plus -userout primers_filt/primerR_matches.txt -userfields query+target+diffs+trowdots+qrow+qlor+qhir
+awk '{print $5}' primers_filt/primerR_matches.txt > primers_filt/primerR_matches_strings.txt
+awk '!seen[$0]++' primers_filt/primerR_matches_strings.txt > primers_filt/primerR_matches_strings_derep.txt
+awk 'NR==FNR{strings[$0]; next} {for (string in strings) if ( (idx = index($0,string)) > 0 ) print string, FNR, idx }' primers_filt/primerR_matches_strings_derep.txt primers_filt/primer.matches.fq > primers_filt/primerR_coords.txt
+awk -F$'[ ]' '{print $1,$2+2,$3}' primers_filt/primerR_coords.txt > primers_filt/primerR_coords2.txt
+cat primers_filt/primerR_coords2.txt >> primers_filt/primerR_coords.txt
+awk 'NR==FNR{a[$2]=$3;next} (FNR in a){$0=substr($0,0,a[FNR]-1)}1' primers_filt/primerR_coords.txt primers_filt/primer.matches.fq > primers_filt/primerR.matches.trim.fq
+
+
+## Re-check for remaining oligo matches
+
+usearch -search_oligodb primers_filt/primerR.matches.trim.fq -db primers_filt/primerR_RC.fa -strand plus -userout primers_filt/primer_matches_recheck.txt -userfields query+target+diffs+trowdots+qrow+qlor+qhir
+
+
+## Finally, concatenate the trimmed sequences (with reverse primer regions etc. trimmed off) with the rest of the data
+
+cat primers_filt/primer.notmatched.fq primers_filt/primerR.matches.trim.fq > seqs_trim.fq
+
+## summary report of fastx file
+
+usearch -fastx_info seqs_trim.fq
+
+
+#============================================================================================================================
+
+## Filter based on expected error threshold
+# -fastq_maxee sets the maximum expected error rate across the whole read. Lowering this (e.g. to 0.5) will be more stringent - so higher quality reads as a result, but more discarded reads.
+# -fastq_minlen here is to filter out instances where the previous reverse primer-binding region trimming steps left little or no read length
+
+usearch -fastq_filter seqs_trim.fq -fastqout seqs_filt.fq -fastq_maxee 1.0 -fastq_minlen 50
+
+
+## summary report of fastx file
+
+usearch -fastx_info seqs_filt.fq
+
+
+## Dereplicate (identify unique) sequences (and sort by decreasing sequence abundance)
+
+usearch -fastx_uniques seqs_filt.fq -fastaout seqs_uniques.fa -minuniquesize 2 -sizeout -relabel Uniq
+
+
+## Denoising (error-correction) of amplicon reads
+# -unoise3 here is used as an alternative to -cluster_otus. Dr Edgar argues this is preferable to the traditional approach of generating 97%-similarity otus.
+# For fungi, which are more variable than bacteria in their sequuence similarity thresholds for different taxa (i.e. for some, 95% may differentiate genera, whereas for others 99% may not), I think this is preferable to generating 97% sequence similarity OTUs.
+# -unoise3 includes sequencing error correction, and chimera and PhiX sequence detection and removal
+# The output generates zero-radius OTUs (ZOTUs) of unique biological replicates in place of the traditional (97% sequence similarity) clustered otus (ZOTUs are effectively clustered OTUs with identity of 100%).
+# -minsize option specifies the minimum abundance. Default is 8. (Dr Edgar: "Most of the low-abundance sequences are usually noisy")
+
+usearch -unoise3 seqs_uniques.fa -zotus zotus.fa -minsize 8
+
+
+## Find/replace 'Zotu' with 'Otu' in zotus.fa
+# n.b. Due to an error in the current usearch v.10, you need to find/replace all 'Zotu' with 'Otu' in zotus.fa
+# Command line: use the sed command below. Or manually open zotus.fa in text editor and find/replace.
+
+sed -i 's/\'Zotu'/\'Otu'/g' zotus.fa
+
+
+#============================================================================================================================
+
+### Taxonomy assignments (Sintax) and filtering non-target sequences (e.g. human or mouse sequences).
+# The taxonomic assignment process is to: 1) generate a udb format database from the supplied fasta reference files (or you can create one from your own reference); 2) use this udb file to predict taxonomy for the zOTUs in your dataset (i.e. from -unoise3 (zotus.fa)).
+# Note that there is currently no function in usearch to append taxonomy assignments to an otu table (as per the otu_table_wTax output from qiime). A custom script has been included later in the pipeline to generate this.
+
+## makeudb_sintax
+# generates taxonomy database file in udb format from fasta reference file (e.g. the RDP or UNITE ITS ones downloaded from the usearch website).
+# (note that if you use RDP, it contains both anamorph and some teleomorph names. So be careful if you're comparing it to other data that uses only anamorph names. 
+# Fill in the correct file path for the database .fa file (downloaded from http://www.drive5.com/usearch/manual/sintax_downloads.html) (e.g. either rdp_its_v2.fa or UNITE_22.08.2016.fasta)
+
+mkdir -p taxonomy
+usearch -makeudb_sintax "/path_to_taxonomy_file/UNITE_22.08.2016.fasta" -output taxonomy/fungi_tax.udb
+
+
+## taxonomy prediction of zotus
+
+usearch -sintax zotus.fa -db taxonomy/fungi_tax.udb -tabbedout taxonomy/zotus.sintax.txt -strand both -sintax_cutoff 0.8
+
+
+### Removal of ZOTUs matching non-target (e.g. Human) sequences
+
+## Identify unassigned and poorly assigned zotus
+# Unassigned:
+#   Command line: The awk command below, a. identifies rows with a blank 4th column entry; then b. prints the OTU names (row 1) to a new file (zotus.unassigned.txt)
+# Fungi (unassigned)
+#   (Fungi$) Optional step (included here) if you also wish to double check that these are indeed fungi ((unassigned) 'Fungi' is the top hit against the database that passes the cut off threshold, but since non-fungal sequences are not in the ITS database, there's the chance that these sequences may in fact match non-fungi better than fungi)
+# Eukaryota (unassigned), Metazoa, Plantae
+#   Optional step (included here) for if taxonomy database includes non-fungal taxa (e.g. SILVA or RDP SSU or LSU databases).
+
+awk -F$'\t' '(!length($4)) || ($4~/Fungi$|d:Eukaryota$|Metazoa|Plantae/) {print $1}' taxonomy/zotus.sintax.txt > taxonomy/zotus.unassigned.list.txt
+
+## Extract unassigned zOTUs from .fa file to examine further
+
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.unassigned.list.txt -fastaout taxonomy/zotus.unassigned.fa
+
+
+## NCBI BLAST: Manually check sequences from zotus.unassigned.fa locally using blast nucleotide search (or online, if you don't have it running locally (https://blast.ncbi.nlm.nih.gov/Blast.cgi) - n.b. the online portal may not allow searching for large numbers of sequences at one time).
+# NOTE regarding this pipeline's use of blast assignments: blast is not used here to modifying taxonomy assignments based on blast searches, but is just employed to filter out those unassigned otus that match non-target organisms (such as matches to human/mouse/plant etc. sequences). 
+#   i.e. If -sintax with unite or rdp databases doesn't classify below domain level, but blast does, I would not recommend changing the assignment to match the blast one (this would be fairly ad hoc, and essentially using a less curated database (blast) to modify the results of the more curated one (unite or rdp))
+
+
+## Create new zotus.nontarget.txt file listing zotu id's that matched non-target sequences in blast search (e.g. matching 'Homo sapiens' or 'Mus musculus')
+# (e.g. copy zotus.unassigned.list.txt, re-save as zotus.nontarget.txt, and remove otu id's that matched fungal sequences in blast searching (i.e. retaining ONLY non-target/human/mouse etc. matched zotu ids)
+
+
+## Remove non-target zotus from .fa file
+
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.nontarget.txt -notmatched zotus.filt.fa
+
+
+## Replace blank assignments (in sintax.txt) with "Unassigned"
+# n.b. leaving blank assignments can cause issues in downstream steps (e.g. if using -sintax_summary)
+awk -F$'\t' '{if($4==""){$4="d:Unassigned"}; print $1,$2,$3,$4}' taxonomy/zotus.sintax.txt | awk -v OFS='\t' '{print $1,$2,$3,$4}' > taxonomy/zotus.sintax.edit.txt && mv taxonomy/zotus.sintax.edit.txt taxonomy/zotus.sintax.txt
+
+
+#============================================================================================================================
+
+### Generate zOTU tables and additional filtering
+
+## Map zOTUs back to original full dataset and generate zotu table
+# (n.b. -id sets minimum fractional identity. Default is 0.97, corresponding to 97% identity. Denoised zOTUs (i.e. from -unoise3) also use a 97% identity threshold by default to allow for sequencing and PCR error)
+
+usearch -otutab seqs_trim.fq -zotus zotus.filt.fa -otutabout zotu_table.txt
+
+
+## Optional: filter zOTU table: filter out zOTUs with very low frequency and potential cross-talk
+# -min_otu_freq is used to filter out cross-talk, as well as low frequency reads (which are more likely to be due to error, or biologically less relevant to the system). Read about cross-talk here: http://www.drive5.com/usearch/manual/crosstalk.html
+# Dr Edgar considers the threshold of 0.5% as a reasonable default for filtering cross-talk.
+# I've set the threshold here at 0.1% to be a bit more relaxed.
+# '-min_sample_size 1' removes any samples that have no reads left after the '-min_otu_freq' step
+
+usearch -otutab_trim zotu_table.txt -output zotu_table_filt.txt -min_otu_freq 0.001
+usearch -otutab_trim zotu_table_filt.txt -output zotu_table_filt2.txt -min_sample_size 1
+
+
+## If you wish to then process in QIIME (e.g. taxonomic assignments and diversity analyses), convert otu table to biom v2.1 (hdf5) using the biom command functionality.
+
+biom convert -i zotu_table_filt2.txt -o zotu_table_filt2.biom --table-type 'OTU table' --to-hdf5
+
+
+#============================================================================================================================
+
+### Downstream processing and analyses
+
+
+## zOTU table stats
+# -otutab_stats returns general stats, while the -alpha_div command here returns read counts per sample (e.g. for deciding a threshold of -min_sample_size in the -otutab_trim step below)
+
+usearch -otutab_stats zotu_table_filt2.txt -output zotu_table_report.txt
+usearch -alpha_div zotu_table_filt2.txt -output zotu_table_report_samples.txt -metrics reads
+sort -nk2,2 zotu_table_report_samples.txt -o zotu_table_report_samples.txt
+
+
+## Remove samples with too few reads from zotu table
+# Select -min_sample_size based on stats above (excludes samples with fewer reads)
+
+usearch -otutab_trim zotu_table_filt2.txt -output zotu_table_filt_trim.txt -min_sample_size 2000 
+
+
+## Normalise zOTU table counts to even sequencing depth (i.e. equal number of reads per sample)
+# Select -sample_size based on stats above
+# n.b. Samples with fewer than the passed -sample_size are scaled up, not deleted
+#   To delete samples with too few reads, FIRST use -otutab_trim (above)
+
+usearch -otutab_norm zotu_table_filt_trim.txt -output zotu_table_even.txt -sample_size 2000
+
+
+## Sort zotu table (based on total relative abundance)
+
+usearch -otutab_sortotus zotu_table_even.txt -output zotu_table_even_sorted.txt
+
+
+## Generate ZOTU_table_wTax
+# This provides an output similar to what you would get out of qiime with a column of taxonomy assignments appended to the end of the zotu table.
+# These commands 1. merge the sintax.txt taxonomy assignments with the zotu_table based on matching the zotu ids (in the first column of both files), and pull out the zotu IDs, zotu counts, and taxonomy; 2. re-sort zotus by relative seqeuence abundances
+# (There's no doubt a tidier way of doing this, but it gets the desired result)
+
+cut -f 1,5- <(awk -F$'\t' 'BEGIN{OFS="\t"} {taxonomy = $4; $2=$3=$4=""; print $0, taxonomy}' <(join -t $'\t' --header <(sort -k1,1 <(sed '1i #OTU ID\ttaxonomy_full\tstrand\ttaxonomy' taxonomy/zotus.sintax.txt)) <(sort -k1,1 zotu_table_even_sorted.txt))) > zotu_table_even_wTax.txt
+cat <(head -n 1 zotu_table_even_wTax.txt) <(cut -f2- <(sort -k1nr <(tail -n +2 <(paste <(awk '{sum=0; for(i=2;i<NF;i++) {sum+=$i} print sum}' zotu_table_even_wTax.txt) zotu_table_even_wTax.txt)))) > zotu_table_even_sorted_wTax.txt
+
+
+## Rarefaction curves (generates the data - figures will require an external programme)
+# -metric options include: 'richness', 'shannon_2' (Shannon index, logging to base 2), 'simpson' etc. Default is richness.
+
+mkdir -p diversity/alpha_div
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/rare_richness.txt -metric richness
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/rare_shannon.txt -metric shannon_2
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/rare_simpson.txt -metric simpson
+
+## Alpha diversity
+# For available metrics see: http://www.drive5.com/usearch/manual/alpha_metrics.html 
+
+usearch -alpha_div zotu_table_even_sorted.txt -output diversity/alpha_div/alpha_div.txt -metrics richness,shannon_2,jost1,simpson,berger_parker
+
+
+## Beta diversity
+# For each metric, up to three output files are generated: a distance matrix in square format, a sorted (to bring similar samples together) distance matrix and a tree (Newick format).
+# Sorted matrices and trees are generated only for metrics which support clustering
+# Metric names that end with _binary are calculated based on presence/absence alone (i.e. unweighted metrics)
+# For available metrics see: http://www.drive5.com/usearch/manual/beta_metrics.html
+# The tree is generated (-cluster_agg, default is based on maximum linkage) for the unifrac (phylogeny based) metric.
+
+mkdir -p diversity/beta_div
+usearch -cluster_agg zotus.filt.fa -treeout diversity/beta_div/zotus.tree
+usearch -beta_div zotu_table_even_sorted.txt -filename_prefix diversity/beta_div/ -tree diversity/beta_div/zotus.tree -metrics jaccard,jaccard_binary,bray_curtis,bray_curtis_binary,unifrac,unifrac_binary
+
+
+## Generate mapping file for other downstream analyses
+# Output: text file including columns for 'SampleID', all alpha diversity outputs, and 'category' (filled with 'default' for all lines).
+# Open the txt file in excel and manually replace 'default' in category field with your categories of interest (e.g. disease, healthy) for each sample (and/or add additional columns (with unique names) for other category groupings). 
+# If you wish to use this for qiime analyses, you will need to manually modify for qiime requirements (the first 3 columns must be: '#SampleID', 'BarcodeSequence', 'LinkerPrimerSequence'; and the last column must be 'Description')
+
+sed -e '1s/Sample/SampleID/' -e '1s/$/\tcategory/' -e '1!s/$/\tdefault/' diversity/alpha_div/alpha_div.txt > mapping.file.txt
+
+
+#============================================================================================================================
+
+## Clean up unnecessary files 
+# Do this manually, or use the following script
+
+rm seqs_filt.fq -rf filter/ primers_filt/
+rm zotu_table.txt zotu_table_filt.txt zotu_table_filt2.txt zotu_table_filt_trim.txt zotu_table_even.txt zotu_table_even_wTax.txt taxonomy/zotus.unassigned*
+
+## End log file print
+
+exit
+
+## re-compress raw data files 
+
+gzip raw_data/*.fastq
+
+
+#============================================================================================================================
+
+### Final files ###
+
+# zOTU tables: zotu_table_even_sorted.txt; zotu_table_even_sorted_wTax (with taxonomy assignments appended)
+# Mapping file: mapping.file.txt
+# Rarefaction: diversity/alpha_div/rare_richness.txt; diversity/alpha_div/rare_shannon.txt; diversity/alpha_div/rare_simpson.txt
+# Alpha diversity: diversity/alpha_div/alpha_div.txt
+# Beta diversity: diversity/beta_div/...
+# Taxonomy assignments: taxonomy/zotus.sintax.txt (all zOTUs); zotu_table_even_sorted_wTax (zOTU table with taxonomy assignments appended)
+# qiime-compatible zOTU table: zotu_table.biom
+
+
+#============================================================================================================================
+#============================================================================================================================
+
+
+
+
+ 
+#============================================================================================================================
+### 1.2 Fungi MiSeq bioinformatics pipeline: Compiled pipeline commands ###
+#============================================================================================================================
+
+### Before you start: 
+
+## i. /raw_data
+# Make a new directory /raw_data in your working/data directory.
+# Add all your raw sequence data to this directory
+
+## ii. primerR.fa
+# In your working directory, make primerR.fa file listing the sequence of the reverse primer used in fasta format (excluding any adapter sequence). 
+# i.e. for ITS2 marker:
+#   primerR.fa
+#   >ITS4
+#   TCCTCCGCTTATTGATATGC
+
+
+### Notes
+# Steps that require an action/intervention are marked with a # comment
+
+#============================================================================================================================
+
+# Add raw data to /raw_data in the working directory
+# make primerR.fa file in the working directory listing the reverse primer sequence in fasta format
+
+# Fill in the correct working directory path below
+
+cd "working_directory_file_path"
+
+script logfile_$(date "+%Y.%m.%d-%H.%M").txt
+gunzip raw_data/*.gz -f
+mkdir -p filter/raw_data
+for i in raw_data/*R1_001.fastq
+    do
+    IN=$i;
+    OUT=filter/${IN%R1_001}.fq
+    usearch -fastq_filter $IN -relabel @ -fastqout $OUT; 
+    done
+cat filter/raw_data/*.fq > filter/seqs.fq
+usearch -fastx_truncate filter/seqs.fq -stripleft 25 -fastqout filter/seqs_trim.fq
+usearch -fastx_info filter/seqs_trim.fq -secs 20
+usearch -fastq_eestats2 filter/seqs_trim.fq -output filter/eestats2.txt -length_cutoffs 180,*,10
+
+# Select the -fastq_trunclen in the next -fastq_filter command based on the output from -fastq_eestats2
+
+usearch -fastq_filter filter/seqs_trim.fq -fastqout filter/seqs_trunc.fq -fastq_truncqual 3 -fastq_trunclen 210
+
+usearch -fastx_info filter/seqs_trunc.fq -secs 20
+mkdir -p primers_filt
+usearch -fastx_revcomp primerR.fa -label_suffix _RC -fastaout primers_filt/primerR_RC.fa
+usearch -search_oligodb filter/seqs_trunc.fq -db primers_filt/primerR_RC.fa -strand plus -userout primers_filt/primer_matches.txt -userfields query+target+diffs+trowdots+qrow+qlor+qhir
+awk '{print $1}' primers_filt/primer_matches.txt > primers_filt/primer_matches_labels.txt
+usearch -fastx_getseqs filter/seqs_trunc.fq -labels primers_filt/primer_matches_labels.txt -fastqout primers_filt/primer.matches.fq -notmatchedfq primers_filt/primer.notmatched.fq
+usearch -search_oligodb primers_filt/primer.matches.fq -db primers_filt/primerR_RC.fa -strand plus -userout primers_filt/primerR_matches.txt -userfields query+target+diffs+trowdots+qrow+qlor+qhir
+awk '{print $5}' primers_filt/primerR_matches.txt > primers_filt/primerR_matches_strings.txt
+awk '!seen[$0]++' primers_filt/primerR_matches_strings.txt > primers_filt/primerR_matches_strings_derep.txt
+awk 'NR==FNR{strings[$0]; next} {for (string in strings) if ( (idx = index($0,string)) > 0 ) print string, FNR, idx }' primers_filt/primerR_matches_strings_derep.txt primers_filt/primer.matches.fq > primers_filt/primerR_coords.txt
+awk -F$'[ ]' '{print $1,$2+2,$3}' primers_filt/primerR_coords.txt > primers_filt/primerR_coords2.txt
+cat primers_filt/primerR_coords2.txt >> primers_filt/primerR_coords.txt
+awk 'NR==FNR{a[$2]=$3;next} (FNR in a){$0=substr($0,0,a[FNR]-1)}1' primers_filt/primerR_coords.txt primers_filt/primer.matches.fq > primers_filt/primerR.matches.trim.fq
+usearch -search_oligodb primers_filt/primerR.matches.trim.fq -db primers_filt/primerR_RC.fa -strand plus -userout primers_filt/primer_matches_recheck.txt -userfields query+target+diffs+trowdots+qrow+qlor+qhir
+
+# Check the output from the last command to make sure the primer-binding region trimming has happened as expected
+
+cat primers_filt/primer.notmatched.fq primers_filt/primerR.matches.trim.fq > seqs_trim.fq
+usearch -fastx_info seqs_trim.fq
+usearch -fastq_filter seqs_trim.fq -fastqout seqs_filt.fq -fastq_maxee 1.0 -fastq_minlen 50
+usearch -fastx_info seqs_filt.fq
+usearch -fastx_uniques seqs_filt.fq -fastaout seqs_uniques.fa -minuniquesize 2 -sizeout -relabel Uniq
+usearch -unoise3 seqs_uniques.fa -zotus zotus.fa -minsize 8
+sed -i 's/\'Zotu'/\'Otu'/g' zotus.fa
+mkdir -p taxonomy
+
+# Taxonomy assignment: Fill in the correct file paths for the database .fa file (downloaded from drive5.com/usearch)
+
+usearch -makeudb_sintax "/path_to_taxonomy_file/UNITE_22.08.2016.fasta" -output taxonomy/fungi_tax.udb
+
+usearch -sintax zotus.fa -db taxonomy/fungi_tax.udb -tabbedout taxonomy/zotus.sintax.txt -strand both -sintax_cutoff 0.8
+awk -F$'\t' '(!length($4)) || ($4~/Fungi$|d:Eukaryota$|Metazoa|Plantae/) {print $1}' taxonomy/zotus.sintax.txt > taxonomy/zotus.unassigned.list.txt
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.unassigned.list.txt -fastaout taxonomy/zotus.unassigned.fa
+
+# NCBI BLAST: Manually check sequences from zotus.unassigned.fa using ncbi blast nucleotide (blastn) (locally, or online at https://blast.ncbi.nlm.nih.gov/Blast.cgi)
+# Create new zotus.nontarget.txt file listing zotu id's that matched non-target sequences in blast search (one zotu id per line)
+
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.nontarget.txt -notmatched zotus.filt.fa
+awk -F$'\t' '{if($4==""){$4="d:Unassigned"}; print $1,$2,$3,$4}' taxonomy/zotus.sintax.txt | awk -v OFS='\t' '{print $1,$2,$3,$4}' > taxonomy/zotus.sintax.edit.txt && mv taxonomy/zotus.sintax.edit.txt taxonomy/zotus.sintax.txt
+usearch -otutab seqs_trim.fq -zotus zotus.filt.fa -otutabout zotu_table.txt
+usearch -otutab_trim zotu_table.txt -output zotu_table_filt.txt -min_otu_freq 0.001
+usearch -otutab_trim zotu_table_filt.txt -output zotu_table_filt2.txt -min_sample_size 1
+biom convert -i zotu_table_filt2.txt -o zotu_table_filt2.biom --table-type 'OTU table' --to-hdf5
+usearch -otutab_stats zotu_table_filt2.txt -output zotu_table_report.txt
+usearch -alpha_div zotu_table_filt2.txt -output zotu_table_report_samples.txt -metrics reads
+sort -nk2,2 zotu_table_report_samples.txt -o zotu_table_report_samples.txt
+
+# Decide what rarefaction/subsampling threshold you want to set for all samples and modify the next two sample_size options 
+
+usearch -otutab_trim zotu_table_filt2.txt -output zotu_table_filt_trim.txt -min_sample_size 2000 
+usearch -otutab_norm zotu_table_filt_trim.txt -output zotu_table_even.txt -sample_size 2000
+
+usearch -otutab_sortotus zotu_table_even.txt -output zotu_table_even_sorted.txt
+cut -f 1,5- <(awk -F$'\t' 'BEGIN{OFS="\t"} {taxonomy = $4; $2=$3=$4=""; print $0, taxonomy}' <(join -t $'\t' --header <(sort -k1,1 <(sed '1i #OTU ID\ttaxonomy_full\tstrand\ttaxonomy' taxonomy/zotus.sintax.txt)) <(sort -k1,1 zotu_table_even_sorted.txt))) > zotu_table_even_wTax.txt
+cat <(head -n 1 zotu_table_even_wTax.txt) <(cut -f2- <(sort -k1nr <(tail -n +2 <(paste <(awk '{sum=0; for(i=2;i<NF;i++) {sum+=$i} print sum}' zotu_table_even_wTax.txt) zotu_table_even_wTax.txt)))) > zotu_table_even_sorted_wTax.txt
+mkdir -p diversity/alpha_div
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/rare_richness.txt -metric richness
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/rare_shannon.txt -metric shannon_2
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/rare_simpson.txt -metric simpson
+usearch -alpha_div zotu_table_even_sorted.txt -output diversity/alpha_div/alpha_div.txt -metrics richness,shannon_2,jost1,simpson,berger_parker
+mkdir -p diversity/beta_div
+usearch -cluster_agg zotus.filt.fa -treeout diversity/beta_div/zotus.tree
+usearch -beta_div zotu_table_even_sorted.txt -filename_prefix diversity/beta_div/ -tree diversity/beta_div/zotus.tree -metrics jaccard,jaccard_binary,bray_curtis,bray_curtis_binary,unifrac,unifrac_binary
+sed -e '1s/Sample/SampleID/' -e '1s/$/\tcategory/' -e '1!s/$/\tdefault/' diversity/alpha_div/alpha_div.txt > mapping.file.txt
+rm seqs_filt.fq -rf filter/ primers_filt/
+rm zotu_table.txt zotu_table_filt.txt zotu_table_filt2.txt zotu_table_filt_trim.txt zotu_table_even.txt zotu_table_even_wTax.txt taxonomy/zotus.unassigned*
+exit
+gzip raw_data/*.fastq
+
+### Final files ###
+
+# zOTU tables: zotu_table_even_sorted.txt; zotu_table_even_sorted_wTax (with taxonomy assignments appended)
+# Mapping file: mapping.file.txt
+# Rarefaction: diversity/alpha_div/rare_richness.txt; diversity/alpha_div/rare_shannon.txt; diversity/alpha_div/rare_simpson.txt
+# Alpha diversity: diversity/alpha_div/alpha_div.txt
+# Beta diversity: diversity/beta_div/...
+# Taxonomy assignments: taxonomy/zotus.sintax.txt (all zOTUs); zotu_table_even_sorted_wTax (zOTU table with taxonomy assignments appended)
+# qiime-compatible zOTU table: zotu_table.biom
+
+#============================================================================================================================
+#============================================================================================================================
