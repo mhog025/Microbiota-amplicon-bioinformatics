@@ -40,10 +40,6 @@ i. Full pipeline including step-by-step commentary.
 
 ii. Compiled command lines (without full comments for each step) are provided/reprinted at the end of the document. These include limited comments to indicate when manual intervention is required. Once you are familiar with each of the individual steps, the compiled command lines can be run in the indicated blocks. (n.b. For re-runs of data where the options (such as trimming lengths and subsampling values) have already been established, these can be entered in advance and all lines up to the blastn search step run as one block, and all subsequent steps run as a second block of commands).  
 
-### Pipeline history  
-Developed September 2017 (M Hoggard)  
-Github master branch established June 2018
-
 ### Fungi-specific processing  
 This pipeline does not merge forward and reverse reads. Due to varying lengths of ITS regions, some ITS sequences may be too long for the overlap and these sequences will be lost if reads are merged (i.e. you might filter out some taxa which have long ITS regions).   
 
@@ -83,5 +79,10 @@ If you use this pipeline you should cite all of these Edgar references (the firs
 
 > This bioinformatics pipeline (initial reference using this pipeline)  
 > Hoggard M, Vesty A, Wong G, Montgomery JM, Fourie C, Douglas RG, Biswas K, Taylor MW. Characterising the human mycobiota: a comparison of small subunit rRNA, ITS1, ITS2, and large subunit rRNA genomic targets (*Under review*).
+
+### Pipeline history  
+Developed September 2017 (M Hoggard)  
+Github master branch established June 2018
+
 
 ***
