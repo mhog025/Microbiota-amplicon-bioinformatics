@@ -1,0 +1,424 @@
+#!/bin/bash
+
+#=============================================================================================
+### 16S MiSeq processing pipeline (paired-end demultiplexed reads)
+#=============================================================================================
+
+### Pipeline history
+# Initially developed by Brett Wagner Mackenzie and David Waite 
+# Further modified by Peter Tsai
+# Updated September 2017 for Usearch v.9 onwards to include: usearch-based taxonomy assignment, otu normalisaion, diversity indicies etc., and to remove redundant perl scripts (the function of which have been incorporated into later versions of usearch). (Michael Hoggard)
+
+### usearch manual
+# http://www.drive5.com/usearch/
+
+
+#=============================================================================================
+
+### References
+# If you use this pipeline you should cite all of these Edgar references (the first one is for the program (usearch), and the rest are for specific processing steps), the taxonomy reference database you used, and preferably this pipeline as well/one of the author's papers that uses this pipeline.
+
+
+## USEARCH
+# Edgar,RC (2010) Search and clustering orders of magnitude faster than BLAST, Bioinformatics 26(19), 2460-2461. doi: 10.1093/bioinformatics/btq461.
+
+## Expected error filtering and paired read merging:
+# Edgar, R.C. and Flyvbjerg, H (2014) Error filtering, pair assembly and error correction for next-generation sequencing reads. doi: 10.1093/bioinformatics/btv401.
+
+## UNOISE algorithm (-unoise3)
+# Edgar, R.C. (2016), UNOISE2: Improved error-correction for Illumina 16S and ITS amplicon reads. doi: 10.1101/081257.
+
+## SINTAX algorithm
+# Edgar, R.C. (2016), SINTAX, a simple non-Bayesian taxonomy classifier for 16S and ITS sequences. doi: 10.1101/074161.
+
+## SILVA (usearch version available for download from drive5.com)
+# Quast C, Pruesse E, Yilmaz P, Gerken J, Schweer T, Yarza P, Peplies J, Glockner FO (2013) The SILVA ribosomal RNA gene database project: improved data processing and web-based tools. Nucleic Acids Research 41:D590-D596
+
+## SILVA LTP (usearch version available for download from drive5.com)
+# Yilmaz P, Parfrey LW, Yarza P, Gerken J, Pruesse E, Quast C, Schweer T, Peplies J, Ludwig W, Glockner FO (2014) The SILVA and "All-species Living Tree Project (LTP)" taxonomic frameworks. Nucleic Acid Res. 42:D643-D648
+
+## NCBI blast
+# NCBI BLAST: a better web interface. NCBI BLAST: a better web interface. Johnson M et. al. Nucleic Acids Res. 2008 Jul 1;36(Web Server issue):W5-9. doi: 10.1093/nar/gkn201
+
+## This bioinformatics pipeline (initial reference using this pipeline)
+# Hoggard M et al. (In preparation).
+
+
+#============================================================================================================================
+### 1.1 Bacterial 16S rRNA MiSeq bioinformatics pipeline: Step-by-step commentary ###
+#============================================================================================================================
+
+### Before you start: 
+
+## /raw_data
+# Make a new directory /raw_data in your working directory.
+# Add all your raw sequence data to this directory
+
+
+### Notes:
+# Compiled command lines (without full comments for each step) are provided/reprinted at the end of this document (with single comments to indicate when manual intervention is required).
+
+#============================================================================================================================
+
+## Change directory to working directory 
+
+cd "directory_file_path"
+
+
+## Start logfile
+
+script logfile_$(date "+%Y.%m.%d-%H.%M").txt
+
+
+## unzip data files if necessary 
+
+gunzip raw_data/*.gz -f
+
+
+## Trim primer-binding regions
+# Dr Edgar recommends trimming primer-binding regions of sequences (you can read about it here: http://drive5.com/usearch/manual/pipe_readprep_primers.html)
+# Set -stripleft based on the length of the longest primer (i.e. 341F = 17 bp, 785R = 21 bp)
+
+mkdir -p filter/raw_data
+for i in raw_data/*.fastq
+do
+IN=$i;
+OUT=filter/${IN%}.fq
+usearch -fastx_truncate $IN -stripleft 21 -fastqout $OUT; 
+done
+
+
+## Merge forward and reverse reads
+# *_R1_* is a wildcard that stipulates all files that have R1 in the title (as is currently standard for illumina forward reads. if -reverse is not stated, it automatically finds the equivalent file with R2 in the title.
+# -relabel @ takes the start of the file name for each pair (up until the first underscore) and appends ";sample=_____" to each merged pair to retain sample identifiers in the single concatenated fq file.
+# -fastq_maxdiffs sets the number of accepted differences in the overlap. Default is 5. Dr Edgar notes to consider increasing if you have long overlaps.
+
+usearch -fastq_mergepairs filter/raw_data/*_R1_*.fq -relabel @ -fastqout merged.fq -fastq_trunctail 3 -fastq_maxdiffs 5 -fastq_minmergelen 200 
+
+
+## Filter based on expected error threshold
+# -fastq_maxee sets the maximum expected error rate across the whole read. Lowering this (e.g. to 0.5) will be more stringent - so higher quality reads as a result, but more discarded reads.
+
+usearch -fastq_filter merged.fq -fastq_maxee 1.0 -relabel Filt -fastqout seqs_filt.fq
+
+
+## summary report of fastx file
+
+usearch -fastx_info seqs_filt.fq -secs 20
+
+
+## Dereplicate (identify unique) sequences (and sort by decreasing sequence abundance)
+
+usearch -fastx_uniques seqs_filt.fq -fastaout seqs_filt_uniques.fa -minuniquesize 2 -sizeout -relabel Uniq
+
+
+## Denoising (error-correction) of amplicon reads
+# -unoise3 here is used as an alternative to -cluster_otus. Dr Edgar argues this is preferable to the traditional approach of generating 97%-similarity otus.
+# -unoise3 includes sequencing error correction, and chimera and PhiX sequence detection and removal
+# The output generates zero-radius OTUs (ZOTUs) of unique biological replicates in place of the traditional (97% sequence similarity) clustered otus (ZOTUs are effectively clustered OTUs with identity of 100%).
+# -minsize option specifies the minimum abundance. Default is 8. (Dr Edgar: "Most of the low-abundance sequences are usually noisy")
+
+usearch -unoise3 seqs_filt_uniques.fa -zotus zotus.fa -minsize 8
+
+
+## Find/replace 'Zotu' with 'Otu' in zotus.fa
+# n.b. Due to an error in the current usearch v.10, you need to find/replace all 'Zotu' with 'Otu' in zotus.fa
+# Command line: you can use the sed command below. Or manually open zotus.fa in text editor and find/replace.
+
+sed -i 's/\'Zotu'/\'Otu'/g' zotus.fa
+
+
+#============================================================================================================================
+
+### Taxonomy assignments (Sintax) and filtering non-target sequences (e.g. human sequences).
+# The taxonomic assignment process is to: 1) generate a udb format database from the supplied fasta reference files (or you can create one from your own reference); 2) use this udb file to predict taxonomy for the zOTUs in your dataset (i.e. from -unoise3 (zotus.fa)).
+# Note that there is currently no function in usearch to append taxonomy assignments to an otu table (as per the otu_table_wTax output from qiime). A custom script has been included later in the pipeline to generate this.
+
+
+## makeudb_sintax
+# generates taxonomy database file in udb format from fasta reference file (e.g. the RDP, silva, or greengenes databases downloaded from the usearch website).
+# n.b. here you can choose from the following reference options: RDP training set, greengenes, SILVA (full), SILVA_LTP (named isolate subset).
+# It's up to you which you choose to use. Dr Edgar argues on his website for the use of smaller well-annotated and curated databases (e.g. the RDP training set and SILVA_LTP references) over the larger databases available (full SILVA, or greengenes). You can read about it here: http://www.drive5.com/usearch/manual/faq_utax_largedb.html
+# Fill in the correct file path for the database .fa file (downloaded from http://www.drive5.com/usearch/manual/sintax_downloads.html) (e.g. ltp_16s_v123.fa)
+
+mkdir -p taxonomy
+usearch -makeudb_sintax "/path_to_taxonomy_file/ltp_16s_v123.fa" -output taxonomy/bacteria_tax.udb
+
+
+## taxonomy prediction of zotus
+
+usearch -sintax zotus.fa -db taxonomy/bacteria_tax.udb -tabbedout taxonomy/zotus.sintax.txt -strand plus -sintax_cutoff 0.8
+
+
+### Removal of ZOTUs of non-target (e.g. Human) sequences
+
+## Identify unassigned zotus
+# Unassigned:
+#   Command line: The awk command below, a. identifies rows with a blank 4th column entry; then b. prints the ZOTU names (row 1) to a new file (zotus.unassigned.txt)
+# Bacteria (unassigned)
+#   (Bacteria$) Optional step (included here) if you also wish to double check that these are indeed bacteria ((unassigned) 'Bacteria' is the top hit against the database that passes the cut off threshold, but if non-bacterial sequences are not in the database, there's the chance that these sequences may in fact match non-bacteria better than bacteria)
+
+awk -F$'\t' '(!length($4)) || ($4~/Bacteria$/) {print $1}'  taxonomy/zotus.sintax.txt > taxonomy/zotus.unassigned.txt
+
+
+## Extract unassigned zOTUs from .fa file(s) to examine further
+
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.unassigned.txt -fastaout taxonomy/zotus.unassigned.fa
+
+
+## NCBI BLAST: Manually check sequences from zotus.unassigned.fa locally using blast nucleotide search (or online, if you don't have it running locally (https://blast.ncbi.nlm.nih.gov/Blast.cgi) - n.b. the online portal may not allow searching for large numbers of sequences at one time).
+# NOTE regarding this pipeline's use of blast assignments: blast is not used here to modifying taxonomy assignments based on blast searches, but is just employed to filter out those unassigned zotus that match non-target organisms (such as matches to human/mouse etc. sequences). 
+#   i.e. If -sintax with silva or greengenes database doesn't classify below domain level, but blast does, I would not recommend changing the assignment to match the blast one (this would be fairly ad hoc, and essentially using a less curated database (blast) to modify the results of the more curated one (silva or greengenes))
+
+
+## Create new zotus.nontarget.txt file listing zotu id's that matched non-target sequences in blast search (e.g. matching 'Homo sapiens' or 'Mus musculus')
+# (e.g. copy zotus.unassigned.txt, re-save as zotus.nontarget.txt, and remove zotu id's that matched bacterial sequences in blast searching (i.e. retaining ONLY non-target/human/mouse etc. matched zotu ids)
+
+
+## Remove non-target zotus from .fa file
+
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.nontarget.txt -notmatched zotus.filt.fa
+
+
+## Replace blank assignments (in sintax.txt) with "Unassigned"
+# n.b. leaving blank assignments can cause issues in downstream steps (e.g. if using -sintax_summary)
+awk -F$'\t' '{if($4==""){$4="Unassigned"}; print $1,$2,$3,$4}' taxonomy/zotus.sintax.txt | awk -v OFS='\t' '{print $1,$2,$3,$4}' > taxonomy/zotus.sintax.edit.txt && mv taxonomy/zotus.sintax.edit.txt taxonomy/zotus.sintax.txt
+
+
+#============================================================================================================================
+
+### Generate zOTU tables and additional filtering
+
+## Map zOTUs back to original full dataset and generate zotu table
+# (n.b. -id sets minimum fractional identity. Default is 0.97, corresponding to 97% identity. Denoised zOTUs (i.e. from -unoise3) also use a 97% identity threshold by default to allow for sequencing and PCR error)
+
+usearch -otutab merged.fq -zotus zotus.filt.fa -otutabout zotu_table.txt
+
+
+## Optional: filter zOTU table: filter out zOTUs with very low frequency and potential cross-talk
+# -min_otu_freq is used to filter out cross-talk, as well as low frequency reads (which are more likely to be due to error, or biologically less relevant to the system). Read about cross-talk here: http://www.drive5.com/usearch/manual/crosstalk.html
+# Dr Edgar considers the threshold of 0.5% as a reasonable default for filtering cross-talk.
+# I've set the threshold here at 0.1% to be a bit more relaxed.
+# '-min_sample_size 1' removes any samples that have no reads left after the '-min_otu_freq' step
+
+usearch -otutab_trim zotu_table.txt -output zotu_table_filt.txt -min_otu_freq 0.001
+usearch -otutab_trim zotu_table_filt.txt -output zotu_table_filt2.txt -min_sample_size 1
+
+
+## If you wish to then process in QIIME (e.g. taxonomic assignments and diversity analyses), convert zotu table to biom v2.1 (hdf5) using the biom command functionality.
+
+biom convert -i zotu_table_filt2.txt -o zotu_table_filt.biom --table-type 'OTU table' --to-hdf5
+
+
+#============================================================================================================================
+
+### Downstream processing and analyses
+
+
+## zOTU table stats
+# -otutab_stats returns general stats, while the -alpha_div command here returns read counts per sample (e.g. for deciding a threshold of -min_sample_size in the -otutab_trim step below)
+
+usearch -otutab_stats zotu_table_filt2.txt -output zotu_table_report.txt
+usearch -alpha_div zotu_table_filt2.txt -output zotu_table_report_samples.txt -metrics reads
+sort -nk2,2 zotu_table_report_samples.txt -o zotu_table_report_samples.txt
+
+
+## Remove samples with too few reads from zotu table
+# Select -min_sample_size based on stats above (excludes samples with fewer reads)
+
+usearch -otutab_trim zotu_table_filt2.txt -output zotu_table_filt_trim.txt -min_sample_size 2000 
+
+
+## Normalise zOTU table counts to even sequencing depth (i.e. equal number of reads per sample)
+# Select -sample_size based on stats above
+# n.b. Samples with fewer than the passed -sample_size are scaled up, not deleted
+#   To delete samples with too few reads, FIRST use -otutab_trim (above)
+
+usearch -otutab_norm zotu_table_filt_trim.txt -output zotu_table_even.txt -sample_size 2000
+
+
+## Sort zotu table (based on total relative abundance)
+
+usearch -otutab_sortotus zotu_table_even.txt -output zotu_table_even_sorted.txt
+
+
+## Generate ZOTU_table_wTax
+# This provides an output similar to what you would get out of qiime with a column of taxonomy assignments appended to the end of the zotu table.
+# These commands 1. merge the sintax.txt taxonomy assignments with the zotu_table based on matching the zotu ids (in the first column of both files), and pull out the zotu IDs, zotu counts, and taxonomy; 2. re-sort zotus by relative seqeuence abundances
+# (There's no doubt a tidier way of doing this, but it gets the desired result)
+
+cut -f 1,5- <(awk -F$'\t' 'BEGIN{OFS="\t"} {taxonomy = $4; $2=$3=$4=""; print $0, taxonomy}' <(join -t $'\t' --header <(sort -k1,1 <(sed '1i #OTU ID\ttaxonomy_full\tstrand\ttaxonomy' taxonomy/zotus.sintax.txt)) <(sort -k1,1 zotu_table_even_sorted.txt))) > zotu_table_even_wTax.txt
+cat <(head -n 1 zotu_table_even_wTax.txt) <(cut -f2- <(sort -k1nr <(tail -n +2 <(paste <(awk '{sum=0; for(i=2;i<NF;i++) {sum+=$i} print sum}' zotu_table_even_wTax.txt) zotu_table_even_wTax.txt)))) > zotu_table_even_sorted_wTax.txt
+
+
+## Rarefaction curves (generates the data - figures will require an external programme)
+# -metric options include: 'richness', 'shannon_2' (Shannon index, logging to base 2), 'simpson' etc. Default is richness.
+
+mkdir -p diversity/alpha_div
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_rare_richness.txt -metric richness
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_rare_shannon.txt -metric shannon_2
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_rare_simpson.txt -metric simpson
+
+
+## Alpha diversity
+# For available metrics see: http://www.drive5.com/usearch/manual/alpha_metrics.html 
+
+usearch -alpha_div zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_alpha_div.txt -metrics richness,shannon_2,jost1,simpson,berger_parker
+
+
+## Beta diversity
+# For each metric, up to three output files are generated: a distance matrix in square format, a sorted (to bring similar samples together) distance matrix and a tree (Newick format).
+# Sorted matrices and trees are generated only for metrics which support clustering
+# Metric names that end with _binary are calculated based on presence/absence alone (i.e. unweighted metrics)
+# For available metrics see: http://www.drive5.com/usearch/manual/beta_metrics.html
+# The tree is generated (-cluster_agg, default is based on maximum linkage) for the unifrac (phylogeny based) metric.
+
+mkdir -p diversity/beta_div
+usearch -cluster_agg zotus.filt.fa -treeout diversity/beta_div/zotus.tree
+usearch -beta_div zotu_table_even_sorted.txt -filename_prefix diversity/beta_div/ -tree diversity/beta_div/zotus.tree -metrics jaccard,jaccard_binary,bray_curtis,bray_curtis_binary,unifrac,unifrac_binary
+
+
+## Generate mapping file for other downstream analyses
+# Output: text file including columns for 'SampleID', all alpha diversity outputs, and 'category' (filled with 'default' for all lines).
+# Open the txt file in excel and manually replace 'default' in category field with your categories of interest (e.g. disease, healthy) for each sample (and/or add additional columns (with unique names) for other category groupings). 
+# If you wish to use this for qiime analyses, you will need to manually modify for qiime requirements (the first 3 columns must be: '#SampleID', 'BarcodeSequence', 'LinkerPrimerSequence'; and the last column must be 'Description')
+
+sed -e '1s/Sample/SampleID/' -e '1s/$/\tcategory/' -e '1!s/$/\tdefault/' diversity/alpha_div/alpha_div.txt > mapping.file.txt
+
+
+#============================================================================================================================
+
+## Clean up unneccesary files 
+# Do this manually, or use the following script
+
+rm seqs_filt* -rf filter/ 
+rm zotus.fa zotu_table.txt zotu_table_filt_trim.txt zotu_table_even.txt zotu_table_even_wTax.txt taxonomy/zotus.unassigned.fa taxonomy/zotus.unassigned.txt
+
+
+## End log file
+
+exit
+
+
+## Re-compress raw data
+
+gzip raw_data/*.fastq
+
+
+#============================================================================================================================
+
+### Final files ###
+
+# zOTU tables: zotu_table_even_sorted.txt; zotu_table_even_sorted_wTax.txt (with taxonomy assignments appended)
+# Mapping file: mapping.file.txt
+# Rarefaction: diversity/alpha_div/rare_richness.txt; diversity/alpha_div/rare_shannon.txt; diversity/alpha_div/rare_simpson.txt
+# Alpha diversity: diversity/alpha_div/alpha_div.txt
+# Beta diversity: diversity/beta_div/...
+# Taxonomy assignments: taxonomy/zotus.sintax.txt (all zOTUs); zotu_table_even_sorted_wTax (zOTU table with taxonomy assignments appended)
+# qiime-compatible zOTU table: zotu_table.biom
+
+
+#============================================================================================================================
+#============================================================================================================================
+
+
+
+
+
+
+
+
+#============================================================================================================================
+### 1.2 Bacterial 16S rRNA MiSeq bioinformatics pipeline: Compiled pipeline commands ###
+#============================================================================================================================
+
+### Before you start: 
+
+## /raw_data
+# Make a new directory /raw_data in your working directory.
+# Add all your raw sequence data to this directory
+
+
+### Notes
+# n.b. steps that require an action/intervention are marked with a # comment
+
+#============================================================================================================================
+
+# Add raw data to /raw_data in the working directory
+
+# Open teminal (linux) or command promt window (e.g. download gygwin.exe; cmd.exe didn't work for me) (Windows)
+# Fill in the correct directory path below
+
+cd "directory_file_path"
+script logfile_$(date "+%Y.%m.%d-%H.%M").txt
+gunzip raw_data/*.gz -f
+mkdir -p filter/raw_data
+for i in raw_data/*.fastq
+do
+IN=$i;
+OUT=filter/${IN%}.fq
+usearch -fastx_truncate $IN -stripleft 21 -fastqout $OUT; 
+done
+usearch -fastq_mergepairs filter/raw_data/*_R1_*.fq -relabel @ -fastqout merged.fq -fastq_trunctail 3 -fastq_maxdiffs 5 -fastq_minmergelen 200 
+usearch -fastq_filter merged.fq -fastq_maxee 1.0 -relabel Filt -fastqout seqs_filt.fq
+usearch -fastx_info seqs_filt.fq -secs 20
+usearch -fastx_uniques seqs_filt.fq -fastaout seqs_filt_uniques.fa -minuniquesize 2 -sizeout -relabel Uniq
+usearch -unoise3 seqs_filt_uniques.fa -zotus zotus.fa -minsize 8
+sed -i 's/\'Zotu'/\'Otu'/g' zotus.fa
+mkdir -p taxonomy
+
+# Taxonomy assignment: Fill in the correct file path for the database .fa file (downloaded from drive5.com/usearch)
+
+usearch -makeudb_sintax "/path_to_taxonomy_file/ltp_16s_v123.fa" -output taxonomy/bacteria_tax.udb
+usearch -sintax zotus.fa -db taxonomy/bacteria_tax.udb -tabbedout taxonomy/zotus.sintax.txt -strand plus -sintax_cutoff 0.8
+awk -F$'\t' '(!length($4)) || ($4~/Bacteria$/) {print $1}'  taxonomy/zotus.sintax.txt > taxonomy/zotus.unassigned.txt
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.unassigned.txt -fastaout taxonomy/zotus.unassigned.fa
+
+# NCBI BLAST: Manually check sequences from zotus.unassigned.fa using ncbi blast nucleotide (blastn) (locally, or online at https://blast.ncbi.nlm.nih.gov/Blast.cgi)
+# Create new zotus.nontarget.txt file listing zotu id's that matched non-target sequences in blast search (one zotu id per line)
+
+usearch -fastx_getseqs zotus.fa -labels taxonomy/zotus.nontarget.txt -notmatched zotus.filt.fa
+awk -F$'\t' '{if($4==""){$4="Unassigned"}; print $1,$2,$3,$4}' taxonomy/zotus.sintax.txt | awk -v OFS='\t' '{print $1,$2,$3,$4}' > taxonomy/zotus.sintax.edit.txt && mv taxonomy/zotus.sintax.edit.txt taxonomy/zotus.sintax.txt
+usearch -otutab merged.fq -zotus zotus.filt.fa -otutabout zotu_table.txt
+usearch -otutab_trim zotu_table.txt -output zotu_table_filt.txt -min_otu_freq 0.001
+usearch -otutab_trim zotu_table_filt.txt -output zotu_table_filt2.txt -min_sample_size 1
+biom convert -i zotu_table_filt2.txt -o zotu_table_filt.biom --table-type 'OTU table' --to-hdf5
+usearch -otutab_stats zotu_table_filt2.txt -output zotu_table_report.txt
+usearch -alpha_div zotu_table_filt2.txt -output zotu_table_report_samples.txt -metrics reads
+sort -nk2,2 zotu_table_report_samples.txt -o zotu_table_report_samples.txt
+
+# Decide what rarefaction/subsampling threshold you want to set for all samples and modify the next two sample_size options 
+
+usearch -otutab_trim zotu_table_filt2.txt -output zotu_table_filt_trim.txt -min_sample_size 2000 
+usearch -otutab_norm zotu_table_filt_trim.txt -output zotu_table_even.txt -sample_size 2000
+
+usearch -otutab_sortotus zotu_table_even.txt -output zotu_table_even_sorted.txt
+cut -f 1,5- <(awk -F$'\t' 'BEGIN{OFS="\t"} {taxonomy = $4; $2=$3=$4=""; print $0, taxonomy}' <(join -t $'\t' --header <(sort -k1,1 <(sed '1i #OTU ID\ttaxonomy_full\tstrand\ttaxonomy' taxonomy/zotus.sintax.txt)) <(sort -k1,1 zotu_table_even_sorted.txt))) > zotu_table_even_wTax.txt
+cat <(head -n 1 zotu_table_even_wTax.txt) <(cut -f2- <(sort -k1nr <(tail -n +2 <(paste <(awk '{sum=0; for(i=2;i<NF;i++) {sum+=$i} print sum}' zotu_table_even_wTax.txt) zotu_table_even_wTax.txt)))) > zotu_table_even_sorted_wTax.txt
+mkdir -p diversity/alpha_div
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_rare_richness.txt -metric richness
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_rare_shannon.txt -metric shannon_2
+usearch -alpha_div_rare zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_rare_simpson.txt -metric simpson
+usearch -alpha_div zotu_table_even_sorted.txt -output diversity/alpha_div/zotus_alpha_div.txt -metrics richness,shannon_2,jost1,simpson,berger_parker
+mkdir -p diversity/beta_div
+usearch -cluster_agg zotus.filt.fa -treeout diversity/beta_div/zotus.tree
+usearch -beta_div zotu_table_even_sorted.txt -filename_prefix diversity/beta_div/ -tree diversity/beta_div/zotus.tree -metrics jaccard,jaccard_binary,bray_curtis,bray_curtis_binary,unifrac,unifrac_binary
+sed -e '1s/Sample/SampleID/' -e '1s/$/\tcategory/' -e '1!s/$/\tdefault/' diversity/alpha_div/alpha_div.txt > mapping.file.txt
+rm seqs_filt* -rf filter/ 
+rm zotus.fa zotu_table.txt zotu_table_filt_trim.txt zotu_table_even.txt zotu_table_even_wTax.txt taxonomy/zotus.unassigned.fa taxonomy/zotus.unassigned.txt
+exit
+gzip raw_data/*.fastq
+
+
+### Final files ###
+
+# zOTU tables: zotu_table_even_sorted.txt; zotu_table_even_sorted_wTax.txt (with taxonomy assignments appended)
+# Mapping file: mapping.file.txt
+# Rarefaction: diversity/alpha_div/rare_richness.txt; diversity/alpha_div/rare_shannon.txt; diversity/alpha_div/rare_simpson.txt
+# Alpha diversity: diversity/alpha_div/alpha_div.txt
+# Beta diversity: diversity/beta_div/...
+# Taxonomy assignments: taxonomy/zotus.sintax.txt (all zOTUs); zotu_table_even_sorted_wTax (zOTU table with taxonomy assignments appended)
+# qiime-compatible zOTU table: zotu_table.biom
+
+#============================================================================================================================
+#============================================================================================================================
